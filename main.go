@@ -51,8 +51,8 @@ func (h *ProxyHandler) parseTargetURL(requestPath string) (targetURL *url.URL, r
 		remainingPath = "/"
 	} else {
 		// Split at the path boundary
-		rawTargetURL := cleanPath[:hostStart+pathIndex] // e.g., "https://example.com"
-		remainingPath = cleanPath[hostStart+pathIndex:] // e.g., "/api/foo"
+		rawTargetURL := cleanPath[:hostStart+pathIndex]       // e.g., "https://example.com"
+		remainingPath = "/" + cleanPath[hostStart+pathIndex:] // e.g., "/api/foo"
 
 		// Parse the target URL
 		targetURL, err = url.Parse(rawTargetURL)
