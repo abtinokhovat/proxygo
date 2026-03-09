@@ -14,54 +14,45 @@ const (
 	serverAddr = "localhost" + serverPort
 )
 
-// ProxyHandler handles HTTP proxy requests
+const headerProxyChain = "X-Proxy-Chain"
+
 type ProxyHandler struct {
 	logger *log.Logger
 }
 
-// NewProxyHandler creates a new proxy handler
 func NewProxyHandler() *ProxyHandler {
 	return &ProxyHandler{
 		logger: log.New(log.Writer(), "[PROXY] ", log.LstdFlags),
 	}
 }
 
-// parseTargetURL extracts the target URL and remaining path from the request
 func (h *ProxyHandler) parseTargetURL(requestPath string) (targetURL *url.URL, remainingPath string, err error) {
-	// Remove leading slash: /https://example.com/api/foo -> https://example.com/api/foo
 	cleanPath := strings.TrimPrefix(requestPath, "/")
 
-	// Find the protocol separator (://)
 	protocolIndex := strings.Index(cleanPath, "://")
 	if protocolIndex == -1 {
 		return nil, "", fmt.Errorf("invalid format: expected /http(s)://host/path")
 	}
 
-	// Find the first slash after the host part
-	// Start searching after the protocol://host part
-	hostStart := protocolIndex + 3 // Skip "://"
+	hostStart := protocolIndex + 3
 	pathIndex := strings.Index(cleanPath[hostStart:], "/")
 
 	if pathIndex == -1 {
-		// No path component, the entire string is the target URL
 		targetURL, err = url.Parse(cleanPath)
 		if err != nil {
 			return nil, "", fmt.Errorf("failed to parse target URL: %w", err)
 		}
 		remainingPath = "/"
 	} else {
-		// Split at the path boundary
-		rawTargetURL := cleanPath[:hostStart+pathIndex]       // e.g., "https://example.com"
-		remainingPath = "/" + cleanPath[hostStart+pathIndex:] // e.g., "/api/foo"
+		rawTargetURL := cleanPath[:hostStart+pathIndex]
+		remainingPath = "/" + cleanPath[hostStart+pathIndex:]
 
-		// Parse the target URL
 		targetURL, err = url.Parse(rawTargetURL)
 		if err != nil {
 			return nil, "", fmt.Errorf("failed to parse target URL: %w", err)
 		}
 	}
 
-	// Validate the parsed URL
 	if targetURL.Scheme == "" {
 		return nil, "", fmt.Errorf("missing scheme in target URL")
 	}
@@ -72,28 +63,89 @@ func (h *ProxyHandler) parseTargetURL(requestPath string) (targetURL *url.URL, r
 	return targetURL, remainingPath, nil
 }
 
-// createReverseProxy creates a reverse proxy for the given target URL
-func (h *ProxyHandler) createReverseProxy(targetURL *url.URL, remainingPath string) *httputil.ReverseProxy {
+// parseProxyChain splits the X-Proxy-Chain header into a slice of proxy URLs.
+// Each entry is a full base URL, e.g. ["https://proxy-b.com", "https://proxy-c.com"]
+func parseProxyChain(header string) []string {
+	if header == "" {
+		return nil
+	}
+	parts := strings.Split(header, ",")
+	chain := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if trimmed := strings.TrimSpace(p); trimmed != "" {
+			chain = append(chain, trimmed)
+		}
+	}
+	return chain
+}
+
+// resolveTarget determines the actual target URL and remaining path to proxy to,
+// taking the proxy chain into account.
+//
+// Without a chain:  targetURL=somesite.com,  path=/original/path
+// With a chain:     targetURL=proxy-b.com,   path=/https://somesite.com/original/path
+//
+//	(and the chain header is trimmed by one hop before forwarding)
+func resolveTarget(
+	originalTarget *url.URL,
+	originalPath string,
+	chain []string,
+) (targetURL *url.URL, remainingPath string, forwardChain string, err error) {
+	if len(chain) == 0 {
+		return originalTarget, originalPath, "", nil
+	}
+
+	// Next hop is the first proxy in the chain.
+	nextProxy := chain[0]
+	nextProxyURL, err := url.Parse(nextProxy)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("invalid proxy in chain %q: %w", nextProxy, err)
+	}
+	if nextProxyURL.Scheme == "" || nextProxyURL.Host == "" {
+		return nil, "", "", fmt.Errorf("proxy chain entry must include scheme and host: %q", nextProxy)
+	}
+
+	// Build the path for the next hop:
+	// next proxy expects /<scheme>://<host><path>
+	// e.g. /https://somesite.com/api/foo
+	encodedDestination := originalTarget.Scheme + "://" + originalTarget.Host + originalPath
+	remainingPath = "/" + encodedDestination
+
+	// Remaining chain entries (after the hop we're consuming now) get forwarded.
+	if len(chain) > 1 {
+		forwardChain = strings.Join(chain[1:], ", ")
+	}
+
+	return nextProxyURL, remainingPath, forwardChain, nil
+}
+
+func (h *ProxyHandler) createReverseProxy(
+	targetURL *url.URL,
+	remainingPath string,
+	forwardChain string,
+	originalQuery string,
+) *httputil.ReverseProxy {
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
 
-	// Customize the request director
 	proxy.Director = func(req *http.Request) {
-		// Set the target URL components
 		req.URL.Scheme = targetURL.Scheme
 		req.URL.Host = targetURL.Host
 		req.URL.Path = remainingPath
-		req.URL.RawQuery = req.URL.RawQuery
-
-		// Set the Host header to the target host
+		req.URL.RawQuery = originalQuery
 		req.Host = targetURL.Host
 
-		// Add proxy headers for debugging and tracking
 		req.Header.Set("X-Forwarded-Host", req.Host)
 		req.Header.Set("X-Origin-Host", targetURL.Host)
 		req.Header.Set("X-Proxy-By", "proxygo")
+
+		// Forward the trimmed chain to the next hop, or remove it entirely.
+		if forwardChain != "" {
+			req.Header.Set(headerProxyChain, forwardChain)
+		} else {
+			req.Header.Del(headerProxyChain)
+		}
 	}
 
-	// Handle proxy errors
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		h.logger.Printf("Proxy error for %s: %v", r.URL.Path, err)
 		http.Error(w, fmt.Sprintf("Proxy error: %v", err), http.StatusBadGateway)
@@ -102,11 +154,9 @@ func (h *ProxyHandler) createReverseProxy(targetURL *url.URL, remainingPath stri
 	return proxy
 }
 
-// ServeHTTP handles incoming HTTP requests
 func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.logger.Printf("Received request: %s %s", r.Method, r.URL.Path)
 
-	// Parse the target URL from the request path
 	targetURL, remainingPath, err := h.parseTargetURL(r.URL.Path)
 	if err != nil {
 		h.logger.Printf("Failed to parse target URL: %v", err)
@@ -114,26 +164,37 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.logger.Printf("Proxying to: %s%s", targetURL.String(), remainingPath)
+	chain := parseProxyChain(r.Header.Get(headerProxyChain))
 
-	// Create and serve the reverse proxy
-	proxy := h.createReverseProxy(targetURL, remainingPath)
+	targetURL, remainingPath, forwardChain, err := resolveTarget(targetURL, remainingPath, chain)
+	if err != nil {
+		h.logger.Printf("Failed to resolve proxy chain: %v", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if forwardChain != "" {
+		h.logger.Printf("Chaining via %s, remaining chain: [%s]", targetURL.String(), forwardChain)
+	} else {
+		h.logger.Printf("Proxying to: %s%s", targetURL.String(), remainingPath)
+	}
+
+	proxy := h.createReverseProxy(targetURL, remainingPath, forwardChain, r.URL.RawQuery)
 	proxy.ServeHTTP(w, r)
 }
 
 func main() {
-	// Create the proxy handler
 	handler := NewProxyHandler()
 
-	// Set up the HTTP server
 	server := &http.Server{
 		Addr:    serverPort,
 		Handler: handler,
 	}
 
-	// Start the server
 	handler.logger.Printf("Proxy server starting on %s", serverAddr)
-	handler.logger.Printf("Usage: http://%s/https://example.com/api/endpoint", serverAddr)
+	handler.logger.Printf("Direct:  curl http://%s/https://example.com/api/endpoint", serverAddr)
+	handler.logger.Printf("Chained: curl http://%s/https://example.com/api/endpoint -H 'X-Proxy-Chain: https://proxy-b.com'", serverAddr)
+	handler.logger.Printf("Multi:   curl http://%s/https://example.com/api/endpoint -H 'X-Proxy-Chain: https://proxy-b.com, https://proxy-c.com'", serverAddr)
 
 	if err := server.ListenAndServe(); err != nil {
 		handler.logger.Fatalf("Server failed to start: %v", err)
